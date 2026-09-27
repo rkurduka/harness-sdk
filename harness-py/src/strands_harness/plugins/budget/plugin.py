@@ -1,4 +1,4 @@
-"""Budget plugin: one-line budget enforcement for Strands agents."""
+"""Persistent model-spend enforcement for Strands agents."""
 
 import asyncio
 import logging
@@ -7,9 +7,7 @@ from typing import TYPE_CHECKING
 from strands.hooks import AfterInvocationEvent, BeforeModelCallEvent
 from strands.interventions import Deny
 from strands.plugins import Plugin
-from strands.storage import LocalFileStorage, Storage
-from pathlib import Path
-           
+from strands.storage import Storage
 
 from strands_harness.plugins.budget.aws_pricing import fetch_aws_rates
 from strands_harness.plugins.budget.budget_state import BudgetManager
@@ -22,33 +20,32 @@ logger = logging.getLogger(__name__)
 
 
 class BudgetPlugin(Plugin):
-    """Enforces a persistent spending budget on an agent.
+    """Persist model-call costs and block calls after a budget is exhausted.
 
-    Attach to an agent to cap model-call spending. Costs are estimated from
-    token usage and recorded to storage, so budgets persist across restarts.
-    When the budget is exhausted, further model calls are blocked.
+    The plugin uses the attached agent's session ID as the budget key. A stable
+    session ID reuses the same budget across agent instances. Without session
+    management, Strands generates an ID that remains stable for the lifetime of
+    one agent instance.
 
-    Budgets are keyed by ``session_id``. If not provided, the agent's
-    ``agent_id`` is used (default: ``"default"``), so persistence works even
-    without a session manager.
-
-    A pricing source is required for enforcement: pass ``custom_rates``
-    (keyed by exact model ID) and/or ``use_aws_pricing=True``. Without one,
-    a warning is logged and model calls are not billed. Changing or
-    resetting the budget is deliberately not exposed to the model — use the
-    Python API: ``await plugin.manager.set_budget(...)``.
+    The plugin bills a model only when its runtime model ID matches an entry in
+    ``custom_rates`` or the optional AWS pricing data. Rate values are USD per
+    input and output token.
 
     Example:
         ```python
-        from strands import Agent
-        from strands_budget import BudgetPlugin
+        from strands_harness import create_harness
+        from strands_harness.plugins import BudgetPlugin
 
-        plugin = BudgetPlugin(
+        model_id = "qwen.qwen3-coder-next"
+        budget = BudgetPlugin(
             budget=10.0,
-            session_id="my-project",
-            custom_rates={"qwen.qwen3-coder-next": (0.00000022, 0.0000018)},
+            custom_rates={model_id: (0.22 / 1_000_000, 1.80 / 1_000_000)},
         )
-        agent = Agent(model="qwen.qwen3-coder-next", plugins=[plugin])
+        agent = create_harness(
+            model=model_id,
+            session={"id": "my-project"},
+            plugins=[budget],
+        )
         ```
     """
 
@@ -57,116 +54,88 @@ class BudgetPlugin(Plugin):
     def __init__(
         self,
         budget: float | None = None,
-       # session_id: str | None = None,
         storage: Storage | None = None,
         custom_rates: dict[str, tuple[float, float]] | None = None,
         use_aws_pricing: bool = False,
         aws_region: str = "us-east-1",
     ) -> None:
-        """Initialize the plugin.
+        """Initialize budget enforcement.
 
         Args:
-            budget: Budget limit in USD. Creates or updates the persisted limit
-                on attach. None leaves any existing budget unchanged (and means
-                unlimited if no budget was ever set).
-            session_id: Stable identifier keying the budget in storage. Defaults
-                to the agent's ``agent_id`` at attach time.
+            budget: Budget limit in USD. A value sets or updates the persisted
+                limit when the plugin attaches. ``None`` leaves an existing
+                limit unchanged and creates no limit when state is absent.
             storage: Storage backend for budget state. Defaults to local files
                 under ``.agent``.
-            custom_rates: Per-token ``{model_substring: (input_rate, output_rate)}``
-                overrides. Highest precedence: they win over AWS-fetched rates
-                and the built-in defaults.
-            use_aws_pricing: Fetch current Bedrock token prices from the AWS
-                Price List API on attach (requires ``pricing:GetProducts``
-                permission). Covers many model families but not recent Anthropic
-                Claude models; uncovered models keep their static/custom rates.
-                Fetch failures fall back to the static table with a warning.
-            aws_region: The Bedrock region whose prices to fetch.
+            custom_rates: Maps exact model IDs or model ID substrings to
+                ``(input_rate, output_rate)`` in USD per token. Exact matches
+                take precedence, followed by the longest substring match.
+            use_aws_pricing: Fetch Amazon Bedrock on-demand token rates from the
+                AWS Price List API when the plugin attaches. Requires the
+                read-only ``pricing:GetProducts`` permission.
+            aws_region: Amazon Bedrock region used to filter pricing data.
         """
-
         super().__init__()
-        self._pricing_configured = bool(custom_rates or use_aws_pricing)
-        if not self._pricing_configured:
+
+        if budget is not None and not (custom_rates or use_aws_pricing):
             logger.warning(
-                "BudgetPlugin has no pricing source (custom_rates or use_aws_pricing). "
-                "Model calls will NOT be billed, so the budget limit will never be "
-                "enforced. Pass custom_rates={...} or use_aws_pricing=True to enable "
-                "budget enforcement."
-            )
-        if use_aws_pricing and custom_rates:
-            logger.warning(
-                "Pass either custom_rates or use_aws_pricing, In case both provided , "
-                "plugin will look for aws pricing for model."
+                "budget=<%s> | no pricing source configured, model calls will not be billed",
+                budget,
             )
 
         self.manager = BudgetManager(storage=storage)
         self._budget = budget
-        #self._configured_session_id = session_id
         self._custom_rates = custom_rates
         self._use_aws_pricing = use_aws_pricing
         self._aws_region = aws_region
-        #self._session_id: str | None = None
+        self._session_id: str | None = None
         self._intervention: BudgetIntervention | None = None
 
     @property
     def session_id(self) -> str | None:
-        """The resolved session ID (available after attach to an agent)."""
+        """Return the agent session ID after the plugin attaches."""
         return self._session_id
 
     async def init_agent(self, agent: "Agent") -> None:
-        """Attach budget enforcement to the agent.
-
-        Resolves the session ID, applies the configured budget limit, and
-        registers the model-call hooks that enforce and meter spending.
-        """
-
-        session_id = agent.session_id
-        print("SESSION ID %s", session_id)
-        if session_id:
-            base_dir = Path(".agent")
-            session_path = base_dir / "sessions" / "session" / session_id
-            logger.info("Session '%s' uses storage dir: %s", session_id, session_path)
-            agent_session_storage = LocalFileStorage(session_path)
-            self.manager = BudgetManager(storage=agent_session_storage)
+        """Resolve configuration and register the budget hooks on an agent."""
+        self._session_id = agent.session_id
 
         rates = self._custom_rates
         if self._use_aws_pricing:
-            # boto3 is synchronous; keep the event loop free while fetching.
             aws_rates = await asyncio.to_thread(fetch_aws_rates, self._aws_region)
-            # custom_rates keep the last word over fetched prices
             rates = {**aws_rates, **(self._custom_rates or {})}
 
-        self._intervention = BudgetIntervention(self.manager, session_id, rates)
+        self._intervention = BudgetIntervention(self.manager, self._session_id, rates)
 
         if self._budget is not None:
-            state = await self.manager.load(session_id)
+            state = await self.manager.load(self._session_id)
             if state is None or state.total_budget != self._budget:
-                await self.manager.set_budget(session_id, self._budget)
-                logger.info("Budget for session '%s' set to $%.2f", session_id, self._budget)
+                await self.manager.set_budget(self._session_id, self._budget)
+                logger.info(
+                    "session_id=<%s>, budget=<%.5f> | budget limit set",
+                    self._session_id,
+                    self._budget,
+                )
 
         agent.add_hook(self._before_model, BeforeModelCallEvent)
         agent.add_hook(self._after_invocation, AfterInvocationEvent)
 
     async def _before_model(self, event: BeforeModelCallEvent) -> None:
-        """Cancel the model call if the budget is exhausted. Fails closed."""
-        assert self._intervention is not None  # set in init_agent
+        """Bill pending usage and cancel a call when its budget is exhausted."""
+        assert self._intervention is not None
         try:
             decision = await self._intervention.before_model_call(event)
         except Exception:
-            logger.exception("Budget check failed; blocking model call (fail closed)")
+            logger.exception("budget check failed, blocking model call")
             event.cancel = "Budget check failed; model call blocked."
             return
         if isinstance(decision, Deny):
             event.cancel = decision.reason
 
     async def _after_invocation(self, event: AfterInvocationEvent) -> None:
-        """Bill the final model cycle when the invocation ends.
-
-        Mid-invocation cycles are billed by the before-model hook; usage from
-        the last cycle only appears in the metrics after the loop finishes.
-        """
-        assert self._intervention is not None  # set in init_agent
+        """Bill usage from the final model call in an agent invocation."""
+        assert self._intervention is not None
         try:
             await self._intervention.record_usage(event.agent)
         except Exception:
-            logger.exception("Failed to record model call cost")
+            logger.exception("final model-call usage could not be recorded")

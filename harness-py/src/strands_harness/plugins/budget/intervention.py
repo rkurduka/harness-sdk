@@ -1,4 +1,4 @@
-"""Budget intervention: blocks model calls when the session budget is exhausted."""
+"""Budget checks and token-usage accounting for model calls."""
 
 import logging
 from typing import Any
@@ -13,35 +13,15 @@ logger = logging.getLogger(__name__)
 
 
 class BudgetIntervention(InterventionHandler):
-    """Enforces a per-session spending budget on model calls.
+    """Record model-call costs and deny calls after a budget is exhausted.
 
-    Before each model call, any newly consumed tokens (tracked as a delta
-    against the agent's accumulated usage) are priced and recorded, then the
-    session budget is checked and the call is denied if spending has reached
-    the limit.
+    Strands updates accumulated usage after its after-model hooks run. Before
+    each model call, this intervention bills usage from the preceding call and
+    then checks the persisted budget. ``BudgetPlugin`` also calls
+    ``record_usage`` after an invocation to bill its final model call.
 
-    Billing happens in ``before_model_call`` rather than ``after_model_call``
-    because the SDK updates ``accumulated_usage`` only after the after-model
-    event has fired. The final cycle of an invocation must therefore be billed
-    by calling ``record_usage(agent)`` when the invocation ends — the
-    ``BudgetPlugin`` does this via an ``AfterInvocationEvent`` hook. If you use
-    this handler standalone (via ``Agent(interventions=[...])``), leftover
-    usage is billed at the start of the next invocation instead.
-
-    Sessions without a budget are unlimited: all operations no-op.
-
-    Note: output tokens can't be known before a call, so the call that
-    crosses the limit completes; the *next* call is blocked.
-
-    Example:
-        ```python
-        from strands import Agent
-        from strands_budget import BudgetIntervention, BudgetManager
-
-        manager = BudgetManager()
-        await manager.set_budget("my-session", 10.0)
-        agent = Agent(interventions=[BudgetIntervention(manager, "my-session")])
-        ```
+    A model call that crosses the limit completes because its output usage is
+    not known in advance. The next model call is denied.
     """
 
     name = "budget-intervention"
@@ -52,78 +32,87 @@ class BudgetIntervention(InterventionHandler):
         session_id: str,
         rates: dict[str, tuple[float, float]] | None = None,
     ) -> None:
-        """Initialize the intervention.
+        """Initialize accounting for one session ID.
 
         Args:
             manager: Budget manager used to load state and record costs.
-            session_id: Stable identifier keying the budget in storage.
-            rates: Per-token ``{model_id: (input_rate, output_rate)}`` table,
-                looked up by exact model ID. Models without an entry are not
-                billed.
+            session_id: Identifier that keys budget state in storage.
+            rates: Maps exact model IDs or model ID substrings to per-token
+                ``(input_rate, output_rate)`` values in USD.
         """
         self.manager = manager
         self.session_id = session_id
         self.rates = rates or {}
-        # Accumulated token counts already billed. after_model_call bills
-        # only the delta between the agent's running totals and these.
         self._billed_input_tokens = 0
         self._billed_output_tokens = 0
 
     @property
     def on_error(self) -> OnError:
-        """Fail closed: if budget checks error out, block the call."""
+        """Deny the model call when a budget check fails."""
         return "deny"
 
     async def before_model_call(self, event: BeforeModelCallEvent, **kwargs: Any) -> Proceed | Deny:
-        """Bill any unbilled usage, then deny the call if the budget is exhausted."""
-        # The SDK updates accumulated_usage only after AfterModelCallEvent has
-        # fired, so the previous cycle's tokens are billed here, just before
-        # the next call — keeping mid-invocation enforcement accurate.
+        """Bill pending usage and return whether the next call may proceed."""
         await self.record_usage(event.agent)
         state = await self.manager.load(self.session_id)
         if state is None:
-            return Proceed()  # no budget set = unlimited
-        if state.is_exhausted():
-            reason = (
-                f"Budget exhausted for session '{self.session_id}': "
-                f"spent ${state.spent:.5f} of ${state.total_budget:.5f}"
-            )
-            logger.critical(reason)
-            return Deny(reason=reason)
-        return Proceed()
+            return Proceed()
+        if not state.is_exhausted():
+            return Proceed()
+
+        reason = (
+            f"Budget exhausted for session '{self.session_id}': spent ${state.spent:.5f} of ${state.total_budget:.5f}"
+        )
+        logger.critical(
+            "session_id=<%s>, spent=<%.5f>, budget=<%.5f> | budget exhausted",
+            self.session_id,
+            state.spent,
+            state.total_budget,
+        )
+        return Deny(reason=reason)
+
+    def _find_rates(self, model_id: str) -> tuple[float, float] | None:
+        """Return the exact or most-specific substring rate for a model ID."""
+        exact = self.rates.get(model_id)
+        if exact is not None:
+            return exact
+
+        normalized_model_id = model_id.lower()
+        matches = [key for key in self.rates if key.lower() in normalized_model_id]
+        if not matches:
+            return None
+        return self.rates[max(matches, key=len)]
 
     async def record_usage(self, agent: Any) -> None:
-        """Bill any tokens accumulated since the last billing.
-
-        Reads the agent's accumulated usage metrics, computes the delta since
-        the previous call, prices it, and records a transaction. Called before
-        each model call and again when the invocation ends (the SDK only
-        updates usage metrics after ``AfterModelCallEvent`` has fired).
-        """
+        """Record accumulated token usage that has not been billed yet."""
         usage = agent.event_loop_metrics.accumulated_usage
         input_total = usage.get("inputTokens", 0)
         output_total = usage.get("outputTokens", 0)
 
+        if input_total < self._billed_input_tokens or output_total < self._billed_output_tokens:
+            self._billed_input_tokens = 0
+            self._billed_output_tokens = 0
+
         new_input = input_total - self._billed_input_tokens
         new_output = output_total - self._billed_output_tokens
-
-        # Advance the anchors before awaiting storage so a failed
-        # record_cost can't lead to double billing on the next call.
-        self._billed_input_tokens = input_total
-        self._billed_output_tokens = output_total
-
         if new_input <= 0 and new_output <= 0:
-            return  # nothing new to bill
+            return
 
-        model_id = agent.model.get_config().get("model_id", "unknown")
+        model_id = agent.model.get_config().get("model_id")
         if not model_id:
-            logger.warning("No model ID found in agent config, skipping billing")
-            return  # no model ID = can't bill
+            self._mark_billed(input_total, output_total)
+            logger.warning("model ID unavailable, skipping budget charge")
+            return
 
-        model_rates = self.rates.get(model_id, None)
-        if not model_rates:
-            logger.warning(f"No rate found for model {model_id}, skipping billing")
-            return  # no rate = can't bill
+        if not self.rates:
+            self._mark_billed(input_total, output_total)
+            return
+
+        model_rates = self._find_rates(model_id)
+        if model_rates is None:
+            self._mark_billed(input_total, output_total)
+            logger.warning("model_id=<%s> | no budget rate found, skipping charge", model_id)
+            return
 
         cost = estimate_cost(new_input, new_output, model_rates)
         state = await self.manager.record_cost(
@@ -133,11 +122,19 @@ class BudgetIntervention(InterventionHandler):
             input_tokens=new_input,
             output_tokens=new_output,
         )
+        self._mark_billed(input_total, output_total)
+
         if state is not None:
             logger.debug(
-                "Billed $%.6f (%d in / %d out tokens); remaining $%.6f",
+                "session_id=<%s>, cost=<%.8f>, input_tokens=<%d>, output_tokens=<%d>, remaining=<%.8f> "
+                "| model call billed",
+                self.session_id,
                 cost,
                 new_input,
                 new_output,
                 state.remaining,
             )
+
+    def _mark_billed(self, input_tokens: int, output_tokens: int) -> None:
+        self._billed_input_tokens = input_tokens
+        self._billed_output_tokens = output_tokens

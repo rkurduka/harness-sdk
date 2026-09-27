@@ -1,12 +1,11 @@
-"""Budget state models and manager for persisting spend across sessions."""
+"""Persisted budget state and accounting operations."""
 
-import os
 from datetime import datetime, timezone
 
 from pydantic import BaseModel, Field
 from strands.storage import LocalFileStorage, Storage
 
-DEFAULT_STORAGE_DIR = os.path.expanduser(".agent")
+DEFAULT_STORAGE_DIR = ".agent"
 
 
 def _utc_now_iso() -> str:
@@ -14,7 +13,7 @@ def _utc_now_iso() -> str:
 
 
 class Transaction(BaseModel):
-    """A single recorded cost event."""
+    """Cost and token usage recorded for one model call."""
 
     description: str
     cost: float
@@ -24,7 +23,7 @@ class Transaction(BaseModel):
 
 
 class BudgetState(BaseModel):
-    """The persisted budget for a single session."""
+    """Budget limit, spend, and transaction history for one session ID."""
 
     session_id: str
     total_budget: float
@@ -33,44 +32,41 @@ class BudgetState(BaseModel):
 
     @property
     def remaining(self) -> float:
-        """Amount left to spend."""
+        """Return the unspent budget in USD."""
         return self.total_budget - self.spent
 
     def is_exhausted(self) -> bool:
-        """True when spending has reached or exceeded the budget."""
+        """Return whether recorded spend has reached the budget limit."""
         return self.spent >= self.total_budget
 
 
 class BudgetManager:
-    """Loads and saves budget state through any Strands ``Storage`` backend.
+    """Load and update budget state through a Strands storage backend.
 
-    A missing budget means unlimited spending: ``load`` returns ``None`` and
-    ``record_cost``/``reset`` are no-ops for sessions without a budget.
+    A missing state has no budget limit. In that case, ``load`` returns
+    ``None``, and ``record_cost`` and ``reset`` make no changes.
     """
 
     def __init__(self, storage: Storage | None = None) -> None:
-        self.storage = storage or LocalFileStorage(DEFAULT_STORAGE_DIR)
+        """Initialize the manager with local storage or a supplied backend."""
+        self.storage = storage if storage is not None else LocalFileStorage(DEFAULT_STORAGE_DIR)
 
     def _key(self, session_id: str) -> str:
         return f"strands-budget/{session_id}.json"
 
     async def load(self, session_id: str) -> BudgetState | None:
-        """Return the budget for a session, or None if no budget is set.
-
-        Corrupt data raises ``pydantic.ValidationError`` rather than being
-        silently discarded.
-        """
+        """Load the state for a session ID, or return ``None`` when absent."""
         data = await self.storage.read(self._key(session_id))
         if data is None:
             return None
         return BudgetState.model_validate_json(data)
 
     async def save(self, state: BudgetState) -> None:
-        """Persist the budget state as JSON bytes."""
+        """Persist a complete budget state."""
         await self.storage.write(self._key(state.session_id), state.model_dump_json(indent=2).encode())
 
     async def set_budget(self, session_id: str, amount: float) -> BudgetState:
-        """Create a budget, or update the limit while preserving spend history."""
+        """Set the limit while preserving recorded spend and transactions."""
         state = await self.load(session_id)
         if state is None:
             state = BudgetState(session_id=session_id, total_budget=amount)
@@ -87,11 +83,12 @@ class BudgetManager:
         input_tokens: int = 0,
         output_tokens: int = 0,
     ) -> BudgetState | None:
-        """Add a transaction and increase spent. No-op if no budget is set."""
+        """Add model-call cost and token usage when a budget exists."""
         state = await self.load(session_id)
         if state is None:
             return None
-        state.spent += round(cost, 6)  # avoid floating point errors
+
+        state.spent += cost
         state.transactions.append(
             Transaction(
                 description=description,
@@ -104,15 +101,16 @@ class BudgetManager:
         return state
 
     async def reset(self, session_id: str) -> BudgetState | None:
-        """Zero out spending and history, keeping the budget limit. No-op if no budget is set."""
+        """Clear spend and transactions while preserving the budget limit."""
         state = await self.load(session_id)
         if state is None:
             return None
-        state.spent = 0.00000
+
+        state.spent = 0.0
         state.transactions = []
         await self.save(state)
         return state
 
     async def delete(self, session_id: str) -> None:
-        """Remove the budget entirely (spending becomes unlimited)."""
+        """Delete budget state so the session no longer has a limit."""
         await self.storage.delete(self._key(session_id))

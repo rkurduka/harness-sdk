@@ -1,31 +1,20 @@
-"""Colored, prefixed log formatting for the strands_budget package.
-
-Every log record from this package is rendered as:
-
-    [strands-budget-warning] 2026-09-07 18:30:12 message...
-
-with a color per level (when the stream is a terminal):
-    DEBUG=cyan, INFO=green, WARNING=yellow, ERROR=red, CRITICAL=bold red
-
-Only the ``strands_budget`` logger is configured — the root logger and the
-host application's logging setup are left untouched.
-"""
+"""Optional console logging for the budget package."""
 
 import logging
 import sys
 
 _RESET = "\033[0m"
 _LEVEL_COLORS = {
-    logging.DEBUG: "\033[36m",  # cyan
-    logging.INFO: "\033[32m",  # green
-    logging.WARNING: "\033[33m",  # yellow
-    logging.ERROR: "\033[31m",  # red
-    logging.CRITICAL: "\033[1;31m",  # bold red
+    logging.DEBUG: "\033[36m",
+    logging.INFO: "\033[32m",
+    logging.WARNING: "\033[33m",
+    logging.ERROR: "\033[31m",
+    logging.CRITICAL: "\033[1;31m",
 }
 
 
 class _ColorFormatter(logging.Formatter):
-    """Formats records as '[strands-budget-<level>] <timestamp> <message>'."""
+    """Format budget log records with a package and level prefix."""
 
     def __init__(self, use_color: bool) -> None:
         super().__init__()
@@ -37,26 +26,28 @@ class _ColorFormatter(logging.Formatter):
         message = record.getMessage()
         if record.exc_info:
             message = f"{message}\n{self.formatException(record.exc_info)}"
+
         line = f"{prefix} {timestamp} {message}"
-        if self._use_color:
-            color = _LEVEL_COLORS.get(record.levelno, "")
-            return f"{color}{line}{_RESET}"
-        return line
+        if not self._use_color:
+            return line
+        return f"{_LEVEL_COLORS.get(record.levelno, '')}{line}{_RESET}"
 
 
-def setup_logging() -> None:
-    """Attach the colored formatter to the package logger (idempotent).
+def setup_logging(level: int = logging.WARNING) -> None:
+    """Configure prefixed console logs for this package.
 
-    Colors are only emitted when stderr is a real terminal, so log files
-    and CI output stay free of ANSI escape codes.
+    The setup is opt-in and leaves the root logger unchanged. Repeated calls do
+    not add duplicate handlers.
+
+    Args:
+        level: Minimum logging level emitted by the package logger.
     """
-    package_logger = logging.getLogger("strands_budget")
+    package_logger = logging.getLogger("strands_harness.plugins.budget")
     if package_logger.handlers:
-        return  # already configured (or the application configured it)
+        return
 
     handler = logging.StreamHandler()
-    use_color = hasattr(sys.stderr, "isatty") and sys.stderr.isatty()
-    handler.setFormatter(_ColorFormatter(use_color=use_color))
+    handler.setFormatter(_ColorFormatter(use_color=sys.stderr.isatty()))
     package_logger.addHandler(handler)
-    # Don't double-print through the root logger's handlers.
+    package_logger.setLevel(level)
     package_logger.propagate = False
