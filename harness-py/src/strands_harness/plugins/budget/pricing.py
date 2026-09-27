@@ -7,4 +7,5 @@ def estimate_cost(
     rates: tuple[float, float],
 ) -> float:
     """Return model-call cost in USD without display rounding."""
-    return input_tokens * rates[0] + output_tokens * rates[1]
+     
+    return round(input_tokens * rates[0] + output_tokens * rates[1],5)

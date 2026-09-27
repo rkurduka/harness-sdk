@@ -7,7 +7,8 @@ from typing import TYPE_CHECKING
 from strands.hooks import AfterInvocationEvent, BeforeModelCallEvent
 from strands.interventions import Deny
 from strands.plugins import Plugin
-from strands.storage import Storage
+from strands.storage import LocalFileStorage, Storage
+from pathlib import Path
 
 from strands_harness.plugins.budget.aws_pricing import fetch_aws_rates
 from strands_harness.plugins.budget.budget_state import BudgetManager
@@ -98,7 +99,14 @@ class BudgetPlugin(Plugin):
 
     async def init_agent(self, agent: "Agent") -> None:
         """Resolve configuration and register the budget hooks on an agent."""
+        
+        
         self._session_id = agent.session_id
+        base_dir = Path(".agent")
+        session_path = base_dir / "sessions" / "session" / self._session_id
+        logger.info("Session '%s' uses storage dir: %s", self._session_id, session_path)
+        agent_session_storage = LocalFileStorage(session_path)
+        self.manager = BudgetManager(storage=agent_session_storage)
 
         rates = self._custom_rates
         if self._use_aws_pricing:
